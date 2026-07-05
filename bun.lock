@@ -6,13 +6,16 @@
       "name": "@surrealdb/better-auth",
       "dependencies": {
         "better-auth": "^1.6.9",
-        "surrealdb": "^2.0.3",
       },
       "devDependencies": {
         "@better-auth/test-utils": "^1.6.9",
         "@biomejs/biome": "^2.4.14",
         "@types/node": "^25.6.0",
+        "surrealdb": "^2.0.3",
         "vitest": "^4.1.5",
+      },
+      "peerDependencies": {
+        "surrealdb": "^2.0.3",
       },
     },
   },
