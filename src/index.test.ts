@@ -10,7 +10,7 @@ import {
 import type { ChildProcess } from 'child_process';
 import { spawn } from 'child_process';
 import { organization } from 'better-auth/plugins/organization';
-import { RecordId, Surreal } from 'surrealdb';
+import { DateTime, RecordId, Surreal } from 'surrealdb';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { surrealAdapter } from './index';
 
@@ -115,7 +115,9 @@ describe('SurrealDB Adapter', () => {
 			expect(schema?.code).toContain('fn::auth::team::members');
 			expect(schema?.code).toContain('DEFINE TABLE IF NOT EXISTS member');
 			expect(schema?.code).toContain('DEFINE TABLE IF NOT EXISTS team');
-			expect(schema?.code).toContain('DEFINE TABLE IF NOT EXISTS teamMember');
+			expect(schema?.code).toContain(
+				'DEFINE TABLE IF NOT EXISTS teamMember',
+			);
 			// Tables carry a COMMENT and default to SCHEMAFULL.
 			expect(schema?.code).toContain('SCHEMAFULL COMMENT');
 			// A required string field stays typed; better-auth marks role required.
@@ -170,7 +172,7 @@ describe('SurrealDB Adapter', () => {
 				[team2Id, 'Blue Team'],
 			] as const) {
 				await fnDb.query(
-					`INSERT INTO team { id: $id, name: $name, organizationId: $oid, createdAt: time::now() }`,
+					`INSERT INTO team { id: $id, name: $name, organizationId: $oid, memberCount: 0, createdAt: time::now() }`,
 					{ id: new RecordId('team', tid), name, oid: orgId },
 				);
 			}
@@ -190,7 +192,6 @@ describe('SurrealDB Adapter', () => {
 		afterAll(async () => {
 			await fnDb.close();
 		});
-
 
 		describe('fn::auth::organization::member_of', () => {
 			it('returns true when user is a member', async () => {
@@ -218,7 +219,6 @@ describe('SurrealDB Adapter', () => {
 			});
 		});
 
-
 		describe('fn::auth::organization::get_role', () => {
 			it('returns the correct role for each member', async () => {
 				for (const [userId, oid, expected] of [
@@ -243,7 +243,6 @@ describe('SurrealDB Adapter', () => {
 				expect(role == null).toBe(true);
 			});
 		});
-
 
 		describe('fn::auth::organization::has_role', () => {
 			it('owner satisfies has_role("owner")', async () => {
@@ -316,7 +315,6 @@ describe('SurrealDB Adapter', () => {
 			});
 		});
 
-
 		describe('fn::auth::organization::teams', () => {
 			it('returns 2 team records for org_alpha', async () => {
 				const [n] = await fnDb.query<[number]>(
@@ -334,7 +332,6 @@ describe('SurrealDB Adapter', () => {
 				expect(n).toBe(0);
 			});
 		});
-
 
 		describe('fn::auth::team::member_of', () => {
 			it('returns true when user is in the team', async () => {
@@ -362,7 +359,6 @@ describe('SurrealDB Adapter', () => {
 			});
 		});
 
-
 		describe('fn::auth::team::members', () => {
 			it('returns 2 teamMember records for red team', async () => {
 				const [n] = await fnDb.query<[number]>(
@@ -388,7 +384,6 @@ describe('SurrealDB Adapter', () => {
 				expect(n).toBe(0);
 			});
 		});
-
 
 		describe('fn::auth::organization::has_permission', () => {
 			it('grants an action the role is permitted', async () => {
@@ -468,8 +463,63 @@ describe('SurrealDB Adapter', () => {
 			expect(code).not.toContain('SCHEMALESS');
 		});
 	});
-});
 
+	describe('consumeOne atomicity', () => {
+		it('lets exactly one of two concurrent consumers win the row', async () => {
+			// A second connection makes the race genuine: statements interleave
+			// on the server, so exactly-once can only come from the single
+			// DELETE ... LIMIT 1 statement plus OCC conflict retry.
+			const db2 = new Surreal();
+			await db2.connect(SURREAL_URL);
+			await authenticate(db2);
+			await db2.use({ namespace: SURREAL_NS, database: SURREAL_DB });
+
+			// biome-ignore lint/suspicious/noExplicitAny: minimal options for a direct adapter call
+			const fakeOptions = { plugins: [] } as any;
+			const adapter1 = surrealAdapter({ db })(fakeOptions);
+			const adapter2 = surrealAdapter({ db: db2 })(fakeOptions);
+
+			try {
+				for (let round = 0; round < 5; round++) {
+					await db.query(
+						'INSERT INTO verification { id: $id, identifier: $ident, value: $v, expiresAt: $exp }',
+						{
+							id: new RecordId('verification', `race-${round}`),
+							ident: 'race@example.com',
+							v: `race-tok-${round}`,
+							exp: new DateTime(new Date(Date.now() + 60_000)),
+						},
+					);
+					const where = [
+						{
+							field: 'value',
+							value: `race-tok-${round}`,
+							operator: 'eq',
+							connector: 'AND',
+						} as const,
+					];
+					const [first, second] = await Promise.all([
+						adapter1.consumeOne?.({
+							model: 'verification',
+							where: [...where],
+						}),
+						adapter2.consumeOne?.({
+							model: 'verification',
+							where: [...where],
+						}),
+					]);
+					const winners = [first, second].filter((r) => r !== null);
+					expect(winners).toHaveLength(1);
+					expect((winners[0] as { id: string }).id).toBe(
+						`race-${round}`,
+					);
+				}
+			} finally {
+				await db2.close();
+			}
+		});
+	});
+});
 
 const { execute } = await testAdapter({
 	adapter: async (_options) => surrealAdapter({ db }),

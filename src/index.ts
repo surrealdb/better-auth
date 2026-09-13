@@ -6,8 +6,10 @@ import type {
 	JoinConfig,
 } from 'better-auth/adapters';
 import { createAdapterFactory } from 'better-auth/adapters';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import {
 	DateTime,
+	QueryError,
 	RecordId,
 	type Surreal,
 	type SurrealQueryable,
@@ -209,8 +211,20 @@ function mapFieldTypeToSurreal(type: string, required: boolean): string {
 
 export const surrealAdapter = (config: SurrealDBAdapterConfig) => {
 	let lazyOptions: BetterAuthOptions | null = null;
-	let activeDb: SurrealQueryable = config.db;
-	let txCreated: Array<{ model: string; id: string }> | null = null;
+	/**
+	 * Transaction state is carried by async-local storage rather than a
+	 * shared variable: two concurrent transactions each see their own trx,
+	 * where a factory-closure swap would interleave statements into each
+	 * other's SurrealDB transaction and corrupt a shared rollback list.
+	 */
+	interface TransactionContext {
+		db: SurrealQueryable;
+		created: Array<{ model: string; id: string }>;
+	}
+	const txContext = new AsyncLocalStorage<TransactionContext>();
+
+	const currentDb = (): SurrealQueryable =>
+		txContext.getStore()?.db ?? config.db;
 
 	const tbl = (model: string) => `\`${model}\``;
 
@@ -218,8 +232,47 @@ export const surrealAdapter = (config: SurrealDBAdapterConfig) => {
 		sql: string,
 		bindings: Record<string, unknown>,
 	): Promise<T[]> => {
-		const result = await activeDb.query<[T[]]>(sql, bindings);
+		const result = await currentDb().query<[T[]]>(sql, bindings);
 		return result[0] ?? [];
+	};
+
+	const MAX_CONFLICT_ATTEMPTS = 5;
+
+	/**
+	 * True for SurrealDB's retriable write-conflict error. 3.1.0+ sets the
+	 * structured flag; older servers report it only in the message.
+	 */
+	const isRetriableConflict = (err: unknown): boolean => {
+		if (!(err instanceof QueryError)) return false;
+		return (
+			err.message.includes('conflict') ||
+			err.message.includes('can be retried')
+		);
+	};
+
+	/**
+	 * Retries retriable transaction conflicts with a small linear backoff.
+	 * Only applied outside transactions (inside one, commit-time conflict
+	 * handling owns the outcome), and only safe because the retried work is
+	 * a single statement: selector and mutation re-evaluate together, so a
+	 * conflicted loser observes the winner's commit on the next attempt.
+	 */
+	const withConflictRetry = async <T>(run: () => Promise<T>): Promise<T> => {
+		for (let attempt = 1; ; attempt += 1) {
+			try {
+				return await run();
+			} catch (err) {
+				if (
+					attempt >= MAX_CONFLICT_ATTEMPTS ||
+					txContext.getStore() !== undefined ||
+					!isRetriableConflict(err)
+				)
+					throw err;
+				await new Promise<void>((resolve) =>
+					setTimeout(resolve, attempt * 10),
+				);
+			}
+		}
 	};
 
 	const findManyRaw = async (
@@ -291,26 +344,22 @@ export const surrealAdapter = (config: SurrealDBAdapterConfig) => {
 				cb: (trx: DBTransactionAdapter) => Promise<R>,
 			): Promise<R> => {
 				const trx = await config.db.beginTransaction();
-				const previousDb = activeDb;
-				activeDb = trx;
-				txCreated = [];
+				const ctx: TransactionContext = { db: trx, created: [] };
 				try {
-					const result = await cb(adapterCreator(lazyOptions!));
+					const result = await txContext.run(ctx, () =>
+						cb(adapterCreator(lazyOptions!)),
+					);
 					await trx.commit();
-					txCreated = null;
 					return result;
 				} catch (err) {
-					const toRollback = txCreated ?? [];
-					txCreated = null;
 					try {
 						await trx.cancel();
 					} catch {
 						// cancel is best-effort; SurrealDB in-memory doesn't honour it
 					}
-					activeDb = previousDb;
-					for (const { model, id } of toRollback) {
+					for (const { model, id } of ctx.created) {
 						try {
-							await activeDb.query('DELETE $rid', {
+							await config.db.query('DELETE $rid', {
 								rid: new RecordId(model, id),
 							});
 						} catch {
@@ -318,9 +367,6 @@ export const surrealAdapter = (config: SurrealDBAdapterConfig) => {
 						}
 					}
 					throw err;
-				} finally {
-					txCreated = null;
-					activeDb = previousDb;
 				}
 			},
 		},
@@ -347,8 +393,9 @@ export const surrealAdapter = (config: SurrealDBAdapterConfig) => {
 					bindings,
 				);
 				const record = deserializeRecord(rows[0]);
-				if (txCreated !== null && record?.id) {
-					txCreated.push({ model, id: record.id as string });
+				const ctx = txContext.getStore();
+				if (ctx && record?.id) {
+					ctx.created.push({ model, id: record.id as string });
 				}
 				return record as T;
 			},
@@ -501,7 +548,7 @@ export const surrealAdapter = (config: SurrealDBAdapterConfig) => {
 					model,
 				);
 				try {
-					await activeDb.query(
+					await currentDb().query(
 						`DELETE ${tbl(model)} ${whereSql}`,
 						bindings,
 					);
@@ -529,6 +576,92 @@ export const surrealAdapter = (config: SurrealDBAdapterConfig) => {
 					return rows.length;
 				} catch (err: unknown) {
 					if (isTableNotFoundError(err)) return 0;
+					throw err;
+				}
+			},
+
+			consumeOne: async <T>({
+				model,
+				where,
+			}: {
+				model: string;
+				where: CleanedWhereClause[];
+			}): Promise<T | null> => {
+				const { sql: whereSql, bindings } = buildWhereClause(
+					where,
+					model,
+				);
+				// SurrealDB v3 has no LIMIT on DELETE; the one-row bound lives
+				// in an inner SELECT — the officially documented workaround
+				// (https://surrealdb.com/docs/reference/query-language/statements/delete).
+				// Selector and mutation evaluate in one storage-engine step, so
+				// concurrent consumers cannot both win the same row and a guard
+				// that matches nothing changes nothing.
+				try {
+					const rows = await withConflictRetry(() =>
+						runQuery<SurrealRecord>(
+							`DELETE FROM (SELECT * FROM ${tbl(model)} ${whereSql} LIMIT 1) RETURN BEFORE`,
+							bindings,
+						),
+					);
+					return rows.length
+						? (deserializeRecord(rows[0]) as T)
+						: null;
+				} catch (err: unknown) {
+					if (isTableNotFoundError(err)) return null;
+					throw err;
+				}
+			},
+
+			incrementOne: async <T>({
+				model,
+				where,
+				increment,
+				set,
+			}: {
+				model: string;
+				where: CleanedWhereClause[];
+				increment: Record<string, number>;
+				set?: Record<string, unknown>;
+			}): Promise<T | null> => {
+				const assignments: string[] = [];
+				const assignBindings: Record<string, unknown> = {};
+				let idx = 0;
+				for (const [field, delta] of Object.entries(increment)) {
+					assignments.push(`${field} += $inc${idx}`);
+					assignBindings[`inc${idx}`] = delta;
+					idx += 1;
+				}
+				idx = 0;
+				for (const [field, value] of Object.entries(set ?? {})) {
+					assignments.push(`${field} = $set${idx}`);
+					assignBindings[`set${idx}`] = value;
+					idx += 1;
+				}
+				if (assignments.length === 0) {
+					throw new Error(
+						'incrementOne requires at least one increment or set field',
+					);
+				}
+				const { sql: whereSql, bindings } = buildWhereClause(
+					where,
+					model,
+				);
+				// A field present in both increment and set receives the
+				// increment then the set (set wins) — no better-auth call site
+				// mixes both on one field.
+				try {
+					const rows = await withConflictRetry(() =>
+						runQuery<SurrealRecord>(
+							`UPDATE (SELECT * FROM ${tbl(model)} ${whereSql} LIMIT 1) SET ${assignments.join(', ')} RETURN AFTER`,
+							{ ...bindings, ...assignBindings },
+						),
+					);
+					return rows.length
+						? (deserializeRecord(rows[0]) as T)
+						: null;
+				} catch (err: unknown) {
+					if (isTableNotFoundError(err)) return null;
 					throw err;
 				}
 			},
@@ -599,7 +732,8 @@ export const surrealAdapter = (config: SurrealDBAdapterConfig) => {
 						// Object (json) fields hold arbitrary nested keys, so they
 						// need FLEXIBLE for SurrealDB to accept undeclared subfields
 						// on a SCHEMAFULL table. FLEXIBLE is specified after TYPE.
-						const flexible = fieldTypeStr === 'json' ? ' FLEXIBLE' : '';
+						const flexible =
+							fieldTypeStr === 'json' ? ' FLEXIBLE' : '';
 						lines.push(
 							`DEFINE FIELD IF NOT EXISTS ${dbField} ON TABLE ${tableName} TYPE ${surrealType}${flexible};`,
 						);

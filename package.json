@@ -20,11 +20,11 @@
 		"format": "biome format --write src/"
 	},
 	"dependencies": {
-		"better-auth": "^1.6.9",
+		"better-auth": "^1.7.2",
 		"surrealdb": "^2.0.3"
 	},
 	"devDependencies": {
-		"@better-auth/test-utils": "^1.6.9",
+		"@better-auth/test-utils": "^1.7.2",
 		"@biomejs/biome": "^2.4.14",
 		"@types/node": "^25.6.0",
 		"vitest": "^4.1.5"
